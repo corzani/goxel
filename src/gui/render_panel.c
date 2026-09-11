@@ -25,10 +25,27 @@ void gui_render_panel(void)
     char buf[256];
     pathtracer_t *pt = &goxel.pathtracer;
     material_t *material;
+    bool gpu = pathtracer_gpu_is_supported();
+    int engine = pt->engine;
 
     GL(glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxsize));
     maxsize /= 2; // Because png export already double it.
     goxel.show_export_viewport = true;
+
+    if (gpu) {
+        gui_group_begin(NULL);
+        gui_selectable_toggle(_("GPU"), &pt->engine, PT_ENGINE_GPU,
+                              NULL, -1);
+        gui_selectable_toggle(_("CPU"), &pt->engine, PT_ENGINE_CPU,
+                              NULL, -1);
+        gui_group_end();
+        if (pt->engine != engine) {
+            pathtracer_stop(pt);
+            pt->samples = 0;
+        }
+        gpu = pt->engine == PT_ENGINE_GPU;
+    }
+
     gui_group_begin(NULL);
     gui_checkbox(_("Size"), &goxel.image->export_custom_size, NULL);
     if (!goxel.image->export_custom_size) {
@@ -47,6 +64,11 @@ void gui_render_panel(void)
 
     if (gui_input_int(_("Samples"), &pt->num_samples, 0, 0))
         pt->num_samples = clamp(pt->num_samples, 1, 10000);
+    if (gpu) {
+        if (gui_input_int(_("Bounces"), &pt->bounces, 0, 0))
+            pt->bounces = clamp(pt->bounces, 0, 16);
+        gui_input_float(_("Exposure"), &pt->exposure, 0.1, 0, 10, "%.1f");
+    }
 
     if (pt->status == PT_STOPPED && gui_button(_("Start"), 1, 0))
         pt->status = PT_RUNNING;
@@ -121,6 +143,10 @@ void gui_render_panel(void)
         gui_checkbox(_("Fixed"), &goxel.rend.light.fixed, NULL);
         gui_input_float(_("Intensity"), &goxel.rend.light.intensity,
                         0.1, 0, 10, NULL);
+        if (gpu) {
+            gui_input_float(_("Softness"), &pt->sun_angle,
+                            0.5, 0, 45, "%.1f");
+        }
     } gui_section_end();
 }
 

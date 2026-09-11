@@ -20,6 +20,7 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -66,15 +67,25 @@ static int compile_shader(int shader, const char *code,
 {
     int status, len;
     char *log;
+    char version[64] = "";
     // Common header we add to all the shaders.
 #ifndef GLES2
     const char *pre = "#define highp\n#define mediump\n#define lowp\n";
 #else
     const char *pre = "";
 #endif
-    const char *sources[] = {pre, include1, include2, "#line 0\n", code};
     assert(code);
-    glShaderSource(shader, 5, (const char**)&sources, NULL);
+    // The #version directive has to come before anything else.  Shaders
+    // using it don't get the precision qualifiers defines.
+    if (strncmp(code, "#version", 8) == 0) {
+        len = strcspn(code, "\n");
+        snprintf(version, sizeof(version), "%.*s\n", len, code);
+        code += len;
+        pre = "";
+    }
+    const char *sources[] = {version, pre, include1, include2, "#line 0\n",
+                             code};
+    glShaderSource(shader, 6, (const char**)&sources, NULL);
     glCompileShader(shader);
     glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
 
@@ -326,7 +337,16 @@ void gl_update_uniform(gl_shader_t *shader, const char *name, ...)
     switch (uni->type) {
     case GL_INT:
     case GL_SAMPLER_2D:
+#ifdef GL_SAMPLER_3D
+    case GL_SAMPLER_3D:
+#endif
+#ifdef GL_UNSIGNED_INT_SAMPLER_3D
+    case GL_UNSIGNED_INT_SAMPLER_3D:
+#endif
         GL(glUniform1i(uni->loc, va_arg(args, int)));
+        break;
+    case GL_INT_VEC3:
+        GL(glUniform3iv(uni->loc, 1, va_arg(args, const int*)));
         break;
     case GL_FLOAT:
         GL(glUniform1f(uni->loc, va_arg(args, double)));

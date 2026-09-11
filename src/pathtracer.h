@@ -35,7 +35,13 @@ enum {
     PT_FINISHED,
 };
 
+enum {
+    PT_ENGINE_GPU = 0,
+    PT_ENGINE_CPU,
+};
+
 typedef struct pathtracer_internal pathtracer_internal_t;
+typedef struct pathtracer_gpu pathtracer_gpu_t;
 
 // Hold info about the cycles rendering task.
 typedef struct {
@@ -45,8 +51,13 @@ typedef struct {
     bool force_restart;
     texture_t *texture;
     pathtracer_internal_t *p;
+    pathtracer_gpu_t *gpu;
+    int engine;         // PT_ENGINE_GPU or PT_ENGINE_CPU.
     int num_samples;
     int samples;
+    int bounces;        // GPU engine only.
+    float exposure;     // GPU engine only.
+    float sun_angle;    // Sun angular diameter (degree), GPU engine only.
     struct {
         int type;
         float energy;
@@ -74,3 +85,28 @@ void pathtracer_iter(pathtracer_t *pt, const float viewport[4]);
  * Stop the pathtracer thread if it is running.
  */
 void pathtracer_stop(pathtracer_t *pt);
+
+/*
+ * Function: pathtracer_gpu_is_supported
+ * Return whether the GPU path tracer can run with the current OpenGL context.
+ */
+bool pathtracer_gpu_is_supported(void);
+
+/*
+ * Function: pathtracer_gpu_iter
+ * Add some samples to the GPU rendering and update the pathtracer texture
+ * (and buffer, once finished).
+ */
+void pathtracer_gpu_iter(pathtracer_t *pt);
+
+/*
+ * Function: pathtracer_gpu_reset
+ * Discard the samples of the GPU rendering.
+ */
+void pathtracer_gpu_reset(pathtracer_t *pt);
+
+/*
+ * Function: pathtracer_gpu_release
+ * Release the GPU path tracer graphics resources.
+ */
+void pathtracer_gpu_release(pathtracer_t *pt);

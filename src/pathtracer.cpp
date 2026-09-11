@@ -466,6 +466,7 @@ void pathtracer_iter(pathtracer_t *pt, const float viewport[4])
 void pathtracer_stop(pathtracer_t *pt)
 {
     pathtracer_internal_t *p = pt->p;
+    pathtracer_gpu_reset(pt);
     if (!p) return;
     trace_cancel(p->context);
     delete p;
@@ -479,6 +480,6 @@ extern "C" {
 }
 
 void pathtracer_iter(pathtracer_t *pt, const float viewport[4]) {}
-void pathtracer_stop(pathtracer_t *pt) {}
+void pathtracer_stop(pathtracer_t *pt) { pathtracer_gpu_reset(pt); }
 
 #endif // YOCTO

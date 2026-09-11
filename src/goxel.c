@@ -551,12 +551,19 @@ void goxel_reset(void)
 
     goxel.snap_mask = SNAP_VOLUME | SNAP_IMAGE_BOX;
 
+    pathtracer_gpu_reset(&goxel.pathtracer);
     goxel.pathtracer = (pathtracer_t) {
+        .gpu = goxel.pathtracer.gpu, // Keep the graphics resources.
+        .engine = PT_ENGINE_GPU,
         .num_samples = 512,
+        .bounces = 4,
+        .exposure = 1,
+        .sun_angle = 2,
         .world = {
-            .type = PT_WORLD_UNIFORM,
+            .type = PT_WORLD_SKY,
             .energy = 1,
-            .color = {127, 127, 127, 255}
+            // Ground color for the sky.
+            .color = {80, 90, 105, 255}
         },
         .floor = {
             .color = {157, 172, 157, 255},
@@ -592,6 +599,7 @@ void goxel_create_graphics(void)
 void goxel_release_graphics(void)
 {
     render_deinit();
+    pathtracer_gpu_release(&goxel.pathtracer);
     model3d_release_graphics();
     gui_release_graphics();
     shaders_release_all();
@@ -1025,18 +1033,32 @@ static void render_pathtrace_view(const float viewport[4])
 {
     pathtracer_t *pt = &goxel.pathtracer;
     float a, mat[4][4];
+    bool gpu = pt->engine == PT_ENGINE_GPU && pathtracer_gpu_is_supported();
+    int w = goxel.image->export_width;
+    int h = goxel.image->export_height;
+
+    // The GPU renderer is fast enough to use the full screen resolution on
+    // high DPI displays.
+    if (gpu && !goxel.image->export_custom_size) {
+        w = roundf(w * goxel.screen_scale);
+        h = roundf(h * goxel.screen_scale);
+    }
     // Recreate the buffer if needed.
-    if (    !pt->buf ||
-            pt->w != goxel.image->export_width ||
-            pt->h != goxel.image->export_height) {
+    if (!pt->buf || pt->w != w || pt->h != h) {
         free(pt->buf);
-        pt->w = goxel.image->export_width;
-        pt->h = goxel.image->export_height;
+        pt->w = w;
+        pt->h = h;
         pt->buf = calloc(pt->w * pt->h, 4);
         texture_delete(pt->texture);
         pt->texture = texture_new_surface(pt->w, pt->h, 0);
     }
-    pathtracer_iter(pt, viewport);
+    if (gpu) {
+        // Directly renders into the texture.
+        pathtracer_gpu_iter(pt);
+    } else {
+        pathtracer_iter(pt, viewport);
+        texture_set_data(pt->texture, pt->buf, pt->w, pt->h, 4);
+    }
 
     // Render the buffer.
     mat4_set_identity(mat);
@@ -1044,7 +1066,6 @@ static void render_pathtrace_view(const float viewport[4])
     mat4_iscale(mat, viewport[2], viewport[3], 1);
     mat4_itranslate(mat, 0.5, 0.5, 0);
     mat4_iscale(mat, min(a, 1.f), min(1.f / a, 1.f), 1);
-    texture_set_data(pt->texture, pt->buf, pt->w, pt->h, 4);
     render_img(&goxel.rend, pt->texture, mat,
                EFFECT_NO_SHADING | EFFECT_PROJ_SCREEN | EFFECT_ANTIALIASING);
     render_submit(&goxel.rend, viewport, goxel.back_color);
