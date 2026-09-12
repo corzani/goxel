@@ -108,8 +108,13 @@ typedef struct {
 // Conveniance macro to call snprintf without gcc warning us about
 // possible truncations.
 #define copy_string(dst, src) ({ \
-    int r = snprintf(dst, sizeof(dst), "%s", src); \
-    if (r >= sizeof(dst)) LOG_W("String truncated"); \
+    size_t n_ = strlen(src); \
+    if (n_ >= sizeof(dst)) { \
+        n_ = sizeof(dst) - 1; \
+        LOG_W("String truncated"); \
+    } \
+    memcpy(dst, src, n_); \
+    (dst)[n_] = '\0'; \
 })
 
 static void write_int32(FILE *out, int32_t v)
@@ -261,6 +266,7 @@ void save_to_file(const image_t *img, const char *path)
     layer_t *layer;
     chunk_t c;
     int nb_blocks, index, size, bpos[3], material_idx;
+    pathtracer_t *pt;
     uint64_t uid;
     FILE *out;
     uint8_t *png, *preview;
@@ -431,6 +437,42 @@ void save_to_file(const image_t *img, const char *path)
                            sizeof(goxel.rend.settings.shadow));
     chunk_write_finish(&c, out);
 
+    // Write the render settings.  This is a new chunk, that the older
+    // versions of goxel skip without reading its values.
+    pt = &goxel.pathtracer;
+    material_idx = get_material_idx(img, pt->floor.material);
+    chunk_write_start(&c, out, "RNDR");
+    chunk_write_dict_value(&c, out, "engine", &pt->engine,
+                           sizeof(pt->engine));
+    chunk_write_dict_value(&c, out, "samples", &pt->num_samples,
+                           sizeof(pt->num_samples));
+    chunk_write_dict_value(&c, out, "bounces", &pt->bounces,
+                           sizeof(pt->bounces));
+    chunk_write_dict_value(&c, out, "exposure", &pt->exposure,
+                           sizeof(pt->exposure));
+    chunk_write_dict_value(&c, out, "bloom", &pt->bloom, sizeof(pt->bloom));
+    chunk_write_dict_value(&c, out, "sun_angle", &pt->sun_angle,
+                           sizeof(pt->sun_angle));
+    chunk_write_dict_value(&c, out, "world_type", &pt->world.type,
+                           sizeof(pt->world.type));
+    chunk_write_dict_value(&c, out, "world_sky", &pt->world.sky,
+                           sizeof(pt->world.sky));
+    chunk_write_dict_value(&c, out, "world_energy", &pt->world.energy,
+                           sizeof(pt->world.energy));
+    chunk_write_dict_value(&c, out, "world_color", pt->world.color,
+                           sizeof(pt->world.color));
+    chunk_write_dict_value(&c, out, "world_image", pt->world.image,
+                           strlen(pt->world.image));
+    chunk_write_dict_value(&c, out, "floor_type", &pt->floor.type,
+                           sizeof(pt->floor.type));
+    chunk_write_dict_value(&c, out, "floor_color", pt->floor.color,
+                           sizeof(pt->floor.color));
+    chunk_write_dict_value(&c, out, "floor_size", pt->floor.size,
+                           sizeof(pt->floor.size));
+    chunk_write_dict_value(&c, out, "floor_material", &material_idx,
+                           sizeof(material_idx));
+    chunk_write_finish(&c, out);
+
     HASH_ITER(hh, blocks_table, data, data_tmp) {
         HASH_DEL(blocks_table, data);
         free(data);
@@ -519,11 +561,14 @@ int load_from_file(const char *path, bool replace)
     int i, index, version, x, y, z, material_idx = 0;
     int  dict_value_size;
     char dict_key[256];
-    char dict_value[256];
+    // Large enough for the longest value we write (the environment image
+    // path of the render settings).
+    char dict_value[1024];
     uint64_t uid = 1;
     int aabb[2][3];
     camera_t *camera, *camera_tmp;
     material_t *mat, *mat_tmp;
+    pathtracer_t *pt;
 
     in = fopen(path, "rb");
     if (!in) return -1;
@@ -668,6 +713,30 @@ int load_from_file(const char *path, bool replace)
                 DICT_CPY("fixed", goxel.rend.light.fixed);
                 DICT_CPY("ambient", goxel.rend.settings.ambient);
                 DICT_CPY("shadow", goxel.rend.settings.shadow);
+            }
+        } else if (strncmp(c.type, "RNDR", 4) == 0) {
+            pt = &goxel.pathtracer;
+            while ((chunk_read_dict_value(&c, in, dict_key, dict_value,
+                                          &dict_value_size, __LINE__))) {
+                DICT_CPY("engine", pt->engine);
+                DICT_CPY("samples", pt->num_samples);
+                DICT_CPY("bounces", pt->bounces);
+                DICT_CPY("exposure", pt->exposure);
+                DICT_CPY("bloom", pt->bloom);
+                DICT_CPY("sun_angle", pt->sun_angle);
+                DICT_CPY("world_type", pt->world.type);
+                DICT_CPY("world_sky", pt->world.sky);
+                DICT_CPY("world_energy", pt->world.energy);
+                DICT_CPY("world_color", pt->world.color);
+                if (strcmp(dict_key, "world_image") == 0)
+                    copy_string(pt->world.image, dict_value);
+                DICT_CPY("floor_type", pt->floor.type);
+                DICT_CPY("floor_color", pt->floor.color);
+                DICT_CPY("floor_size", pt->floor.size);
+                if (DICT_CPY("floor_material", material_idx)) {
+                    pt->floor.material = (material_t*)get_material(
+                            goxel.image, material_idx);
+                }
             }
         } else {
             // Ignore other blocks.
