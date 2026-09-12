@@ -54,5 +54,6 @@ uint32_t material_get_hash(const material_t *m)
     ret = XXH32(&m->metallic, sizeof(m->metallic), ret);
     ret = XXH32(&m->roughness, sizeof(m->roughness), ret);
     ret = XXH32(&m->base_color, sizeof(m->base_color), ret);
+    ret = XXH32(&m->ior, sizeof(m->ior), ret);
     return ret;
 }

@@ -52,6 +52,8 @@ struct camera
     float  fovy;
     float  aspect;
     float  mat[4][4];
+    float  aperture; // Lens diameter for the depth of field (0 to disable).
+    float  focus;    // Focus distance, if zero use the rotation distance.
 
     // Auto computed from other values:
     float view_mat[4][4];    // Model to view transformation.

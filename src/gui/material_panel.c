@@ -68,4 +68,6 @@ void gui_material_panel(void)
     }
 
     gui_input_float(_("Opacity"), &mat->base_color[3], 0.1, 0, 1, NULL);
+    // Only used by the GPU renderer.
+    gui_input_float(_("Refraction"), &mat->ior, 0.05, 0, 3, NULL);
 }

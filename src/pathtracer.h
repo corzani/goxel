@@ -22,6 +22,16 @@ enum {
     PT_WORLD_NONE = 0,
     PT_WORLD_UNIFORM,
     PT_WORLD_SKY,
+    PT_WORLD_IMAGE,
+};
+
+// Procedural skies, used with PT_WORLD_SKY.
+enum {
+    PT_SKY_DAY = 0,
+    PT_SKY_SUNSET,
+    PT_SKY_NIGHT,
+    PT_SKY_OVERCAST,
+    PT_SKY_COUNT,
 };
 
 enum {
@@ -57,11 +67,14 @@ typedef struct {
     int samples;
     int bounces;        // GPU engine only.
     float exposure;     // GPU engine only.
+    float bloom;        // Bloom intensity, GPU engine only.
     float sun_angle;    // Sun angular diameter (degree), GPU engine only.
     struct {
         int type;
+        int sky;        // One of the PT_SKY values.
         float energy;
         uint8_t color[4];
+        char image[1024]; // Environment image, for PT_WORLD_IMAGE.
     } world;
     struct {
         int type;
@@ -85,6 +98,19 @@ void pathtracer_iter(pathtracer_t *pt, const float viewport[4]);
  * Stop the pathtracer thread if it is running.
  */
 void pathtracer_stop(pathtracer_t *pt);
+
+/*
+ * Function: pathtracer_sky_name
+ * Return the name of a procedural sky.
+ */
+const char *pathtracer_sky_name(int sky);
+
+/*
+ * Function: pathtracer_sky_colors
+ * Return the colors of a procedural sky, in linear space.
+ */
+void pathtracer_sky_colors(int sky, float zenith[3], float horizon[3],
+                           float ground[3]);
 
 /*
  * Function: pathtracer_gpu_is_supported

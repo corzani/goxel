@@ -68,6 +68,11 @@ void gui_render_panel(void)
         if (gui_input_int(_("Bounces"), &pt->bounces, 0, 0))
             pt->bounces = clamp(pt->bounces, 0, 16);
         gui_input_float(_("Exposure"), &pt->exposure, 0.1, 0, 10, "%.1f");
+        gui_input_float(_("Bloom"), &pt->bloom, 0.05, 0, 2, "%.2f");
+        gui_input_float(_("Aperture"), &goxel.image->active_camera->aperture,
+                        0.5, 0, 100, "%.1f");
+        gui_input_float(_("Focus"), &goxel.image->active_camera->focus,
+                        1, 0, 100000, "%.0f");
     }
 
     if (pt->status == PT_STOPPED && gui_button(_("Start"), 1, 0))
@@ -99,11 +104,38 @@ void gui_render_panel(void)
                               NULL, -1);
         gui_selectable_toggle(_("Sky"), &pt->world.type, PT_WORLD_SKY,
                               NULL, -1);
+        gui_selectable_toggle(_("Image"), &pt->world.type, PT_WORLD_IMAGE,
+                              NULL, -1);
         gui_group_end();
+
+        if (pt->world.type == PT_WORLD_IMAGE) {
+            if (gui_button(_("Choose image"), -1, 0)) {
+                const char *filters[] = {"*.hdr", "*.png", "*.jpg", NULL};
+                const char *env_path = sys_open_file_dialog(
+                        _("Open"), NULL, filters, "hdr, png, jpg");
+                if (env_path) {
+                    snprintf(pt->world.image, sizeof(pt->world.image), "%s",
+                             env_path);
+                }
+            }
+            gui_text("%s", *pt->world.image ? pt->world.image : "-");
+        }
+        if (pt->world.type == PT_WORLD_SKY) {
+            if (gui_combo_begin(_("Sky"),
+                                pathtracer_sky_name(pt->world.sky))) {
+                for (i = 0; i < PT_SKY_COUNT; i++) {
+                    if (gui_combo_item(pathtracer_sky_name(i),
+                                       i == pt->world.sky))
+                        pt->world.sky = i;
+                }
+                gui_combo_end();
+            }
+        }
         if (pt->world.type) {
             gui_input_float(_("Intensity"), &pt->world.energy,
                             0.1, 0, 10, "%.1f");
-            gui_color_small(_("Color"), pt->world.color);
+            if (pt->world.type == PT_WORLD_UNIFORM)
+                gui_color_small(_("Color"), pt->world.color);
         }
     } gui_section_end();
 

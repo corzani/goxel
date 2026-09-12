@@ -41,6 +41,8 @@
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_BMP
+// Used for the environment images of the GPU renderer.
+#define STBI_ONLY_HDR
 #define STBI_NO_GIF
 #include "stb_image.h"
 #include "stb_image_write.h"

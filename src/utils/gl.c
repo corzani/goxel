@@ -345,6 +345,9 @@ void gl_update_uniform(gl_shader_t *shader, const char *name, ...)
 #endif
         GL(glUniform1i(uni->loc, va_arg(args, int)));
         break;
+    case GL_INT_VEC2:
+        GL(glUniform2iv(uni->loc, 1, va_arg(args, const int*)));
+        break;
     case GL_INT_VEC3:
         GL(glUniform3iv(uni->loc, 1, va_arg(args, const int*)));
         break;

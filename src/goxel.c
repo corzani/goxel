@@ -558,6 +558,7 @@ void goxel_reset(void)
         .num_samples = 512,
         .bounces = 4,
         .exposure = 1,
+        .bloom = 0.2,
         .sun_angle = 2,
         .world = {
             .type = PT_WORLD_SKY,

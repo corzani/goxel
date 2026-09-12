@@ -30,6 +30,7 @@ struct material {
     float roughness;
     float base_color[4]; // Linear color.
     float emission[3];
+    float ior;          // Index of refraction, zero for no refraction.
 };
 
 #define MATERIAL_DEFAULT (material_t){ \

@@ -51,6 +51,8 @@ void gui_cameras_panel(void)
     if (gui_section_begin(cam->name, GUI_SECTION_COLLAPSABLE)) {
         gui_input_float(_("Distance"), &cam->dist, 10.0, 0, 0, NULL);
         gui_checkbox(_("Orthographic"), &cam->ortho, NULL);
+        if (!cam->ortho)
+            gui_input_float(_("FOV"), &cam->fovy, 1, 1, 170, "%.0f");
         gui_group_begin(NULL);
         gui_row_begin(2);
         gui_action_button(ACTION_view_left, _("Left"), 1.0);

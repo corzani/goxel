@@ -73,7 +73,7 @@ typedef struct gl_uniform {
 
 typedef struct gl_shader {
     GLint           prog;
-    gl_uniform_t    uniforms[32];
+    gl_uniform_t    uniforms[64];
 } gl_shader_t;
 
 

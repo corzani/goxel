@@ -325,6 +325,8 @@ void save_to_file(const image_t *img, const char *path)
                                sizeof(material->metallic));
         chunk_write_dict_value(&c, out, "roughness", &material->roughness,
                                sizeof(material->roughness));
+        chunk_write_dict_value(&c, out, "ior", &material->ior,
+                               sizeof(material->ior));
         chunk_write_dict_value(&c, out, "emission", &material->emission,
                                sizeof(material->emission));
         chunk_write_finish(&c, out);
@@ -401,6 +403,12 @@ void save_to_file(const image_t *img, const char *path)
                                sizeof(camera->ortho));
         chunk_write_dict_value(&c, out, "mat", &camera->mat,
                                sizeof(camera->mat));
+        chunk_write_dict_value(&c, out, "fovy", &camera->fovy,
+                               sizeof(camera->fovy));
+        chunk_write_dict_value(&c, out, "aperture", &camera->aperture,
+                               sizeof(camera->aperture));
+        chunk_write_dict_value(&c, out, "focus", &camera->focus,
+                               sizeof(camera->focus));
         if (camera == img->active_camera)
             chunk_write_dict_value(&c, out, "active", NULL, 0);
 
@@ -628,6 +636,9 @@ int load_from_file(const char *path, bool replace)
                 DICT_CPY("dist", camera->dist);
                 DICT_CPY("ortho", camera->ortho);
                 DICT_CPY("mat", camera->mat);
+                DICT_CPY("fovy", camera->fovy);
+                DICT_CPY("aperture", camera->aperture);
+                DICT_CPY("focus", camera->focus);
                 if (strcmp(dict_key, "active") == 0)
                     goxel.image->active_camera = camera;
             }
@@ -641,6 +652,7 @@ int load_from_file(const char *path, bool replace)
                 DICT_CPY("metallic", mat->metallic);
                 DICT_CPY("roughness", mat->roughness);
                 DICT_CPY("emission", mat->emission);
+                DICT_CPY("ior", mat->ior);
             }
         } else if (strncmp(c.type, "IMG ", 4) == 0) {
             while ((chunk_read_dict_value(&c, in, dict_key, dict_value,

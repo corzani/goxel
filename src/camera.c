@@ -28,6 +28,7 @@ camera_t *camera_new(const char *name)
     mat4_set_identity(cam->mat);
     cam->dist = 128;
     cam->aspect = 1;
+    cam->fovy = 20;
     mat4_itranslate(cam->mat, 0, 0, cam->dist);
     camera_turntable(cam, M_PI / 4, M_PI / 4);
     return cam;
@@ -98,7 +99,7 @@ void camera_update(camera_t *camera)
     float size;
     float clip_near, clip_far;
 
-    camera->fovy = 20.;
+    if (camera->fovy <= 0) camera->fovy = 20;
     mat4_invert(camera->mat, camera->view_mat);
     compute_clip(camera->view_mat, &clip_near, &clip_far);
     if (camera->ortho) {
@@ -168,6 +169,9 @@ uint32_t camera_get_key(const camera_t *cam)
     key = XXH32(&cam->ortho, sizeof(cam->ortho), key);
     key = XXH32(&cam->dist, sizeof(cam->dist), key);
     key = XXH32(&cam->mat, sizeof(cam->mat), key);
+    key = XXH32(&cam->fovy, sizeof(cam->fovy), key);
+    key = XXH32(&cam->aperture, sizeof(cam->aperture), key);
+    key = XXH32(&cam->focus, sizeof(cam->focus), key);
     return key;
 }
 

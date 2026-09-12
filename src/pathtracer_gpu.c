@@ -39,14 +39,51 @@
 #include "goxel.h"
 #include "shader_cache.h"
 #include "xxhash.h"
+#include "stb_image.h"
 
 #include <limits.h>
+
+// Procedural skies: colors of the zenith, horizon and ground (linear).
+static const struct {
+    const char *name;
+    float zenith[3];
+    float horizon[3];
+    float ground[3];
+} SKIES[PT_SKY_COUNT] = {
+    [PT_SKY_DAY] = {"Day",
+        {0.20, 0.40, 0.85}, {0.80, 0.86, 0.92}, {0.35, 0.33, 0.30}},
+    [PT_SKY_SUNSET] = {"Sunset",
+        {0.08, 0.14, 0.38}, {1.00, 0.45, 0.15}, {0.25, 0.16, 0.10}},
+    [PT_SKY_NIGHT] = {"Night",
+        {0.010, 0.020, 0.060}, {0.04, 0.06, 0.12}, {0.010, 0.012, 0.020}},
+    [PT_SKY_OVERCAST] = {"Overcast",
+        {0.50, 0.54, 0.60}, {0.72, 0.74, 0.78}, {0.30, 0.30, 0.30}},
+};
+
+const char *pathtracer_sky_name(int sky)
+{
+    if (sky < 0 || sky >= PT_SKY_COUNT) return "";
+    return SKIES[sky].name;
+}
+
+void pathtracer_sky_colors(int sky, float zenith[3], float horizon[3],
+                           float ground[3])
+{
+    sky = clamp(sky, 0, PT_SKY_COUNT - 1);
+    vec3_copy(SKIES[sky].zenith, zenith);
+    vec3_copy(SKIES[sky].horizon, horizon);
+    vec3_copy(SKIES[sky].ground, ground);
+}
 
 #if !defined(GLES2) && !defined(__APPLE__)
 
 #define TABLE_FLAG (1u << 30)
 #define FLOOR_MATERIAL 255 // Materials texture index used for the floor.
 #define MAX_SAMPLES_PER_FRAME 16
+#define LIGHTS_TEX_WIDTH 1024 // Must match the shader.
+#define MAX_LIGHTS (1 << 20)
+#define BLOOM_LEVELS 6
+#define BLOOM_THRESHOLD 1.0
 
 static const char *ATTR_NAMES[] = {"a_pos", NULL};
 
@@ -63,6 +100,30 @@ struct pathtracer_gpu {
     GLuint      materials_tex;
     int         grid_origin[3]; // In voxels.
     int         grid_size[3];   // In tiles.
+
+    // Visible emissive voxels, sampled for the direct lighting.
+    int         (*lights)[4];   // Position and material index.
+    int         nb_lights;
+    int         lights_capacity;
+    bool        has_lights;
+    uint32_t    lights_key;
+    int         lights_count;   // Number of lights in the textures.
+    float       lights_power;   // Sum of the lights luminance.
+    GLuint      lights_pos_tex;
+    GLuint      lights_emit_tex;
+
+    // Environment image, and its sampling tables.
+    char        env_path[1024];
+    GLuint      env_tex;
+    GLuint      env_cond_tex;   // Cumulated luminance of each row.
+    GLuint      env_marg_tex;   // Cumulated luminance of the rows.
+    int         env_size[2];
+    float       env_integral;   // Sum of the weighted luminances.
+
+    // Bloom mipmaps: [0] downsampled, [1] upsampled.
+    GLuint      bloom_tex[2][BLOOM_LEVELS];
+    GLuint      bloom_fbo[2][BLOOM_LEVELS];
+    int         bloom_size[BLOOM_LEVELS][2];
 
     // Accumulation buffers.
     int         w, h;
@@ -107,13 +168,13 @@ bool pathtracer_gpu_is_supported(void)
     return supported;
 }
 
-static GLuint create_texture(GLenum target)
+static GLuint create_texture(GLenum target, GLenum filter)
 {
     GLuint tex;
     GL(glGenTextures(1, &tex));
     GL(glBindTexture(target, tex));
-    GL(glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
-    GL(glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+    GL(glTexParameteri(target, GL_TEXTURE_MIN_FILTER, filter));
+    GL(glTexParameteri(target, GL_TEXTURE_MAG_FILTER, filter));
     GL(glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
     GL(glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
     GL(glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE));
@@ -123,13 +184,26 @@ static GLuint create_texture(GLenum target)
 static void init_graphics(pathtracer_gpu_t *gpu)
 {
     const float QUAD[] = {-1, -1, +1, -1, -1, +1, +1, +1};
+    const float zero[4] = {};
 
     GL(glGenBuffers(1, &gpu->quad_buffer));
     GL(glBindBuffer(GL_ARRAY_BUFFER, gpu->quad_buffer));
     GL(glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW));
-    gpu->table_tex = create_texture(GL_TEXTURE_3D);
-    gpu->atlas_tex = create_texture(GL_TEXTURE_3D);
-    gpu->materials_tex = create_texture(GL_TEXTURE_2D);
+    gpu->table_tex = create_texture(GL_TEXTURE_3D, GL_NEAREST);
+    gpu->atlas_tex = create_texture(GL_TEXTURE_3D, GL_NEAREST);
+    gpu->materials_tex = create_texture(GL_TEXTURE_2D, GL_NEAREST);
+    gpu->lights_pos_tex = create_texture(GL_TEXTURE_2D, GL_NEAREST);
+    gpu->lights_emit_tex = create_texture(GL_TEXTURE_2D, GL_NEAREST);
+
+    gpu->env_tex = create_texture(GL_TEXTURE_2D, GL_LINEAR);
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, 1, 1, 0, GL_RGB, GL_FLOAT,
+                    zero));
+    gpu->env_cond_tex = create_texture(GL_TEXTURE_2D, GL_NEAREST);
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 1, 1, 0, GL_RED, GL_FLOAT,
+                    zero));
+    gpu->env_marg_tex = create_texture(GL_TEXTURE_2D, GL_NEAREST);
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 1, 1, 0, GL_RED, GL_FLOAT,
+                    zero));
     GL(glGenFramebuffers(2, gpu->accum_fbo));
     GL(glGenFramebuffers(1, &gpu->display_fbo));
     gpu->samples_per_frame = 1;
@@ -160,19 +234,42 @@ static int get_layer_material(const scene_t *scene, const layer_t *layer)
     return FLOOR_MATERIAL - 1; // Too many materials.
 }
 
+static bool is_emissive(const material_t *mat)
+{
+    return mat && (mat->emission[0] > 0 || mat->emission[1] > 0 ||
+                   mat->emission[2] > 0);
+}
+
+// Key of the voxels grid.  Also depends on the emissive materials, since
+// the lights list is built with the grid.
 static uint32_t get_volume_key(const scene_t *scene)
 {
     const layer_t *layer;
     uint64_t k;
     uint32_t key = 0;
     int material;
+    bool emissive;
 
     for (layer = scene->layers; layer; layer = layer->next) {
         if (!layer->visible || !layer->volume) continue;
         k = volume_get_key(layer->volume);
         material = get_layer_material(scene, layer);
+        emissive = is_emissive(layer->material);
         key = XXH32(&k, sizeof(k), key);
         key = XXH32(&material, sizeof(material), key);
+        key = XXH32(&emissive, sizeof(emissive), key);
+    }
+    return key;
+}
+
+static uint32_t get_lights_key(const scene_t *scene, uint32_t key)
+{
+    const float zero[3] = {};
+    int i;
+
+    for (i = 0; i < scene->nb_materials; i++) {
+        key = XXH32(scene->materials[i] ? scene->materials[i]->emission : zero,
+                    sizeof(zero), key);
     }
     return key;
 }
@@ -218,7 +315,43 @@ static uint32_t get_scene_key(const pathtracer_t *pt, const scene_t *scene,
     key = XXH32(&camera->ortho, sizeof(camera->ortho), key);
     key = XXH32(&camera->dist, sizeof(camera->dist), key);
     key = XXH32(&camera->fovy, sizeof(camera->fovy), key);
+    key = XXH32(&camera->aperture, sizeof(camera->aperture), key);
+    key = XXH32(&camera->focus, sizeof(camera->focus), key);
     return key;
+}
+
+// Add the visible emissive voxels of a tile to the lights list.
+static void add_tile_lights(pathtracer_gpu_t *gpu, const int pos[3],
+                            uint8_t (*voxels)[4], const bool *emissive)
+{
+    const int N = TILE_SIZE;
+    int i, x, y, z, material;
+
+    for (i = 0; i < N * N * N; i++) {
+        material = voxels[i][3];
+        if (!material || !emissive[material - 1]) continue;
+        x = i % N;
+        y = i / N % N;
+        z = i / (N * N);
+        // Skip the voxels surrounded by other voxels of the tile.
+        if (    x > 0 && x < N - 1 && y > 0 && y < N - 1 &&
+                z > 0 && z < N - 1 &&
+                voxels[i - 1][3] && voxels[i + 1][3] &&
+                voxels[i - N][3] && voxels[i + N][3] &&
+                voxels[i - N * N][3] && voxels[i + N * N][3])
+            continue;
+        if (gpu->nb_lights >= MAX_LIGHTS) return;
+        if (gpu->nb_lights >= gpu->lights_capacity) {
+            gpu->lights_capacity = max(1024, gpu->lights_capacity * 2);
+            gpu->lights = realloc(gpu->lights,
+                    gpu->lights_capacity * sizeof(*gpu->lights));
+        }
+        gpu->lights[gpu->nb_lights][0] = pos[0] + x;
+        gpu->lights[gpu->nb_lights][1] = pos[1] + y;
+        gpu->lights[gpu->nb_lights][2] = pos[2] + z;
+        gpu->lights[gpu->nb_lights][3] = material - 1;
+        gpu->nb_lights++;
+    }
 }
 
 // Merge the voxels of all the layers and upload them into the textures.
@@ -233,12 +366,15 @@ static void update_grid(pathtracer_gpu_t *gpu, const scene_t *scene)
     uint32_t *table;
     int i, n = 0, pos[3], bmin[3], bmax[3], atlas[3], block[3], t[3];
     int max_size, max_blocks, material;
-    bool empty;
+    bool empty, emissive[FLOOR_MATERIAL];
 
     for (i = 0; i < 3; i++) {
         bmin[i] = INT_MAX;
         bmax[i] = INT_MIN;
     }
+    for (i = 0; i < FLOOR_MATERIAL; i++)
+        emissive[i] = is_emissive(scene->materials[i]);
+    gpu->nb_lights = 0;
 
     // Collect all the tiles positions.
     for (layer = scene->layers; layer; layer = layer->next) {
@@ -317,9 +453,12 @@ static void update_grid(pathtracer_gpu_t *gpu, const scene_t *scene)
             table[t[0] + t[1] * gpu->grid_size[0] +
                   t[2] * gpu->grid_size[0] * gpu->grid_size[1]] =
                 TABLE_FLAG | block[0] | block[1] << 10 | block[2] << 20;
+            add_tile_lights(gpu, tile->pos, voxels, emissive);
         }
         free(tile);
     }
+    if (gpu->nb_lights >= MAX_LIGHTS)
+        LOG_W("Too many emissive voxels for the GPU path tracer");
 
     GL(glBindTexture(GL_TEXTURE_3D, gpu->table_tex));
     GL(glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI,
@@ -351,6 +490,7 @@ static void update_materials(pathtracer_gpu_t *gpu, const pathtracer_t *pt,
         vec3_copy(mat->emission, data[256 + i]);
         data[512 + i][0] = mat->metallic;
         data[512 + i][1] = mat->roughness;
+        data[512 + i][2] = mat->ior;
     }
 
     // The floor color is picked in sRGB, like the voxels colors.
@@ -364,14 +504,144 @@ static void update_materials(pathtracer_gpu_t *gpu, const pathtracer_t *pt,
                     GL_RGBA, GL_FLOAT, data));
 }
 
+// Upload the lights positions, CDF (by luminance) and emission.
+static void update_lights(pathtracer_gpu_t *gpu, const scene_t *scene)
+{
+    const material_t default_mat = MATERIAL_DEFAULT;
+    const material_t *mat;
+    float (*pos)[4], (*emit)[4], total = 0;
+    int i, n = gpu->nb_lights, w, h;
+
+    w = clamp(n, 1, LIGHTS_TEX_WIDTH);
+    h = max(1, (n + LIGHTS_TEX_WIDTH - 1) / LIGHTS_TEX_WIDTH);
+    pos = calloc(w * h, sizeof(*pos));
+    emit = calloc(w * h, sizeof(*emit));
+    for (i = 0; i < n; i++) {
+        mat = scene->materials[gpu->lights[i][3]] ?: &default_mat;
+        vec3_copy(mat->emission, emit[i]);
+        emit[i][3] = 1;
+        total += 0.2126 * mat->emission[0] + 0.7152 * mat->emission[1] +
+                 0.0722 * mat->emission[2];
+        pos[i][0] = gpu->lights[i][0];
+        pos[i][1] = gpu->lights[i][1];
+        pos[i][2] = gpu->lights[i][2];
+        pos[i][3] = total;
+    }
+    for (i = 0; total > 0 && i < n; i++)
+        pos[i][3] /= total;
+    if (total > 0) pos[n - 1][3] = 1;
+    gpu->lights_count = (total > 0) ? n : 0;
+    gpu->lights_power = total;
+
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->lights_pos_tex));
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0,
+                    GL_RGBA, GL_FLOAT, pos));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->lights_emit_tex));
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0,
+                    GL_RGBA, GL_FLOAT, emit));
+    free(pos);
+    free(emit);
+}
+
+/*
+ * Load the environment image and compute the tables used to sample it:
+ * for each row the cumulated luminance of its pixels, and the cumulated
+ * luminance of the rows.  The luminances are weighted by the solid angle
+ * of the pixels, that shrinks toward the poles.
+ */
+static void update_env(pathtracer_gpu_t *gpu, const pathtracer_t *pt)
+{
+    float *data = NULL, *cond = NULL, *marg = NULL;
+    float sin_theta, lum, total = 0, prev, row;
+    int w = 0, h = 0, n, x, y;
+
+    snprintf(gpu->env_path, sizeof(gpu->env_path), "%s", pt->world.image);
+    gpu->env_integral = 0;
+    memset(gpu->env_size, 0, sizeof(gpu->env_size));
+
+    if (*pt->world.image)
+        data = stbi_loadf(pt->world.image, &w, &h, &n, 3);
+    if (!data) {
+        if (*pt->world.image)
+            LOG_W("Cannot open environment image %s", pt->world.image);
+        return;
+    }
+
+    cond = calloc(w * h, sizeof(*cond));
+    marg = calloc(h, sizeof(*marg));
+    for (y = 0; y < h; y++) {
+        sin_theta = sin(M_PI * (y + 0.5) / h);
+        for (x = 0; x < w; x++) {
+            lum = 0.2126 * data[(y * w + x) * 3 + 0] +
+                  0.7152 * data[(y * w + x) * 3 + 1] +
+                  0.0722 * data[(y * w + x) * 3 + 2];
+            total += max(lum, 0.f) * sin_theta;
+            cond[y * w + x] = total;
+        }
+        marg[y] = total;
+    }
+    // Normalize each row, and the rows themselves.  'prev' keeps the value
+    // of the previous row before it gets normalized.
+    prev = 0;
+    for (y = 0; y < h; y++) {
+        row = marg[y] - prev;
+        for (x = 0; x < w; x++) {
+            cond[y * w + x] = (row > 0) ? (cond[y * w + x] - prev) / row : 1;
+        }
+        prev = marg[y];
+        marg[y] = (total > 0) ? marg[y] / total : 1;
+    }
+
+    gpu->env_size[0] = w;
+    gpu->env_size[1] = h;
+    gpu->env_integral = total;
+
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->env_tex));
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, w, h, 0, GL_RGB, GL_FLOAT,
+                    data));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->env_cond_tex));
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, w, h, 0, GL_RED, GL_FLOAT,
+                    cond));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->env_marg_tex));
+    GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, h, 1, 0, GL_RED, GL_FLOAT,
+                    marg));
+    LOG_I("Environment image %s (%dx%d)", pt->world.image, w, h);
+
+    stbi_image_free(data);
+    free(cond);
+    free(marg);
+}
+
 static void update_buffers(pathtracer_gpu_t *gpu, int w, int h)
 {
-    int i;
+    int i, j;
 
     if (gpu->accum_tex[0] && gpu->w == w && gpu->h == h) return;
+
+    for (i = 0; i < BLOOM_LEVELS; i++) {
+        gpu->bloom_size[i][0] = max(1, (w / 2) >> i);
+        gpu->bloom_size[i][1] = max(1, (h / 2) >> i);
+        for (j = 0; j < 2; j++) {
+            if (!gpu->bloom_tex[j][i]) {
+                gpu->bloom_tex[j][i] = create_texture(GL_TEXTURE_2D,
+                                                      GL_LINEAR);
+                GL(glGenFramebuffers(1, &gpu->bloom_fbo[j][i]));
+            }
+            GL(glBindTexture(GL_TEXTURE_2D, gpu->bloom_tex[j][i]));
+            GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F,
+                            gpu->bloom_size[i][0], gpu->bloom_size[i][1], 0,
+                            GL_RGBA, GL_FLOAT, NULL));
+            GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->bloom_fbo[j][i]));
+            GL(glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                      GL_TEXTURE_2D, gpu->bloom_tex[j][i], 0));
+            assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                   GL_FRAMEBUFFER_COMPLETE);
+        }
+    }
+
     for (i = 0; i < 2; i++) {
         if (!gpu->accum_tex[i])
-            gpu->accum_tex[i] = create_texture(GL_TEXTURE_2D);
+            gpu->accum_tex[i] = create_texture(GL_TEXTURE_2D, GL_LINEAR);
         GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[i]));
         GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0,
                         GL_RGBA, GL_FLOAT, NULL));
@@ -407,6 +677,7 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
     const image_t *image = goxel.image;
     gl_shader_t *shader;
     float light_dir[3], world_color[3], floor_rect[4], center[3] = {};
+    float sky_zenith[3], sky_horizon[3], sky_ground[3];
     float floor_z = 0;
     int i;
 
@@ -419,10 +690,29 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
     GL(glBindTexture(GL_TEXTURE_3D, gpu->atlas_tex));
     GL(glActiveTexture(GL_TEXTURE3));
     GL(glBindTexture(GL_TEXTURE_2D, gpu->materials_tex));
+    GL(glActiveTexture(GL_TEXTURE4));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->lights_pos_tex));
+    GL(glActiveTexture(GL_TEXTURE5));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->lights_emit_tex));
+    GL(glActiveTexture(GL_TEXTURE6));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->env_tex));
+    GL(glActiveTexture(GL_TEXTURE7));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->env_cond_tex));
+    GL(glActiveTexture(GL_TEXTURE8));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->env_marg_tex));
     gl_update_uniform(shader, "u_prev", 0);
     gl_update_uniform(shader, "u_table", 1);
     gl_update_uniform(shader, "u_atlas", 2);
     gl_update_uniform(shader, "u_materials", 3);
+    gl_update_uniform(shader, "u_lights_pos", 4);
+    gl_update_uniform(shader, "u_lights_emit", 5);
+    gl_update_uniform(shader, "u_lights_count", gpu->lights_count);
+    gl_update_uniform(shader, "u_lights_power", gpu->lights_power);
+    gl_update_uniform(shader, "u_env", 6);
+    gl_update_uniform(shader, "u_env_cond", 7);
+    gl_update_uniform(shader, "u_env_marg", 8);
+    gl_update_uniform(shader, "u_env_size", gpu->env_size);
+    gl_update_uniform(shader, "u_env_integral", gpu->env_integral);
     gl_update_uniform(shader, "u_grid_origin", gpu->grid_origin);
     gl_update_uniform(shader, "u_grid_size", gpu->grid_size);
     gl_update_uniform(shader, "u_bounces", pt->bounces);
@@ -431,6 +721,10 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
     gl_update_uniform(shader, "u_tan_fovy", tan(camera->fovy * DD2R / 2));
     gl_update_uniform(shader, "u_ortho_size",
                       camera->ortho ? camera->dist : 0.0);
+    gl_update_uniform(shader, "u_aperture",
+                      camera->ortho ? 0.0 : camera->aperture);
+    gl_update_uniform(shader, "u_focus",
+                      (camera->focus > 0) ? camera->focus : camera->dist);
 
     render_get_light_dir(&goxel.rend, light_dir);
     gl_update_uniform(shader, "u_sun_dir", light_dir);
@@ -443,6 +737,11 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
     gl_update_uniform(shader, "u_world_type", pt->world.type);
     gl_update_uniform(shader, "u_world_energy", pt->world.energy);
     gl_update_uniform(shader, "u_world_color", world_color);
+
+    pathtracer_sky_colors(pt->world.sky, sky_zenith, sky_horizon, sky_ground);
+    gl_update_uniform(shader, "u_sky_zenith", sky_zenith);
+    gl_update_uniform(shader, "u_sky_horizon", sky_horizon);
+    gl_update_uniform(shader, "u_sky_ground", sky_ground);
 
     // Floor at the bottom of the image box, same as the CPU renderer.
     if (!box_is_null(image->box)) {
@@ -470,12 +769,67 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
     }
 }
 
+/*
+ * Compute the bloom from the accumulated samples, with a chain of
+ * downsampled images, then upsampled back while adding each level.
+ * Return the final bloom texture (at half the resolution).
+ */
+static GLuint render_bloom(pathtracer_gpu_t *gpu)
+{
+    const shader_define_t down_defines[] = {{"BLOOM_DOWN", true}, {}};
+    const shader_define_t up_defines[] = {{"BLOOM_UP", true}, {}};
+    gl_shader_t *shader;
+    float size[2];
+    int i;
+
+    shader = shader_get("pathtracer", down_defines, ATTR_NAMES, NULL);
+    GL(glUseProgram(shader->prog));
+    GL(glActiveTexture(GL_TEXTURE0));
+    gl_update_uniform(shader, "u_src", 0);
+    for (i = 0; i < BLOOM_LEVELS; i++) {
+        vec2_set(size, gpu->bloom_size[i][0], gpu->bloom_size[i][1]);
+        GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->bloom_fbo[0][i]));
+        GL(glViewport(0, 0, size[0], size[1]));
+        GL(glBindTexture(GL_TEXTURE_2D, (i == 0) ?
+                         gpu->accum_tex[gpu->accum_cur] :
+                         gpu->bloom_tex[0][i - 1]));
+        gl_update_uniform(shader, "u_dst_size", size);
+        gl_update_uniform(shader, "u_scale",
+                          (i == 0) ? 1.0 / max(gpu->samples, 1) : 1.0);
+        gl_update_uniform(shader, "u_threshold",
+                          (i == 0) ? BLOOM_THRESHOLD : 0.0);
+        draw_quad(gpu);
+    }
+
+    shader = shader_get("pathtracer", up_defines, ATTR_NAMES, NULL);
+    GL(glUseProgram(shader->prog));
+    gl_update_uniform(shader, "u_src", 0);
+    gl_update_uniform(shader, "u_base", 1);
+    for (i = BLOOM_LEVELS - 2; i >= 0; i--) {
+        vec2_set(size, gpu->bloom_size[i][0], gpu->bloom_size[i][1]);
+        GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->bloom_fbo[1][i]));
+        GL(glViewport(0, 0, size[0], size[1]));
+        GL(glActiveTexture(GL_TEXTURE0));
+        GL(glBindTexture(GL_TEXTURE_2D, (i == BLOOM_LEVELS - 2) ?
+                         gpu->bloom_tex[0][i + 1] :
+                         gpu->bloom_tex[1][i + 1]));
+        GL(glActiveTexture(GL_TEXTURE1));
+        GL(glBindTexture(GL_TEXTURE_2D, gpu->bloom_tex[0][i]));
+        gl_update_uniform(shader, "u_dst_size", size);
+        draw_quad(gpu);
+    }
+    return gpu->bloom_tex[1][0];
+}
+
 // Tone map the accumulated samples into the pathtracer texture.
 static void display(pathtracer_gpu_t *gpu, pathtracer_t *pt)
 {
     const shader_define_t defines[] = {{"DISPLAY", true}, {}};
     gl_shader_t *shader;
     uint32_t key;
+    GLuint bloom_tex = gpu->bloom_tex[1][0];
+
+    if (pt->bloom > 0) bloom_tex = render_bloom(gpu);
 
     shader = shader_get("pathtracer", defines, ATTR_NAMES, NULL);
     GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->display_fbo));
@@ -488,15 +842,20 @@ static void display(pathtracer_gpu_t *gpu, pathtracer_t *pt)
     GL(glUseProgram(shader->prog));
     GL(glActiveTexture(GL_TEXTURE0));
     GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur]));
+    GL(glActiveTexture(GL_TEXTURE1));
+    GL(glBindTexture(GL_TEXTURE_2D, bloom_tex));
     gl_update_uniform(shader, "u_accum", 0);
     gl_update_uniform(shader, "u_samples", (float)gpu->samples);
     gl_update_uniform(shader, "u_exposure", pt->exposure);
+    gl_update_uniform(shader, "u_bloom", 1);
+    gl_update_uniform(shader, "u_bloom_intensity", max(pt->bloom, 0));
     draw_quad(gpu);
 
     // Copy the final image into the buffer, so that it can be saved.
     if (pt->status != PT_FINISHED) return;
     key = XXH32(&gpu->scene_key, sizeof(gpu->scene_key), 0);
     key = XXH32(&pt->exposure, sizeof(pt->exposure), key);
+    key = XXH32(&pt->bloom, sizeof(pt->bloom), key);
     key = XXH32(&gpu->samples, sizeof(gpu->samples), key);
     if (key == gpu->display_key) return;
     gpu->display_key = key;
@@ -508,7 +867,7 @@ void pathtracer_gpu_iter(pathtracer_t *pt)
 {
     pathtracer_gpu_t *gpu;
     scene_t scene = {};
-    uint32_t volume_key, scene_key;
+    uint32_t volume_key, scene_key, lights_key;
     int n;
 
     if (!pt->gpu) pt->gpu = calloc(1, sizeof(*pt->gpu));
@@ -533,6 +892,16 @@ void pathtracer_gpu_iter(pathtracer_t *pt)
     if (scene_key != gpu->scene_key || pt->force_restart || gpu->need_reset) {
         gpu->scene_key = scene_key;
         update_materials(gpu, pt, &scene);
+        if (    pt->world.type == PT_WORLD_IMAGE &&
+                strcmp(gpu->env_path, pt->world.image) != 0) {
+            update_env(gpu, pt);
+        }
+        lights_key = get_lights_key(&scene, volume_key);
+        if (!gpu->has_lights || lights_key != gpu->lights_key) {
+            update_lights(gpu, &scene);
+            gpu->lights_key = lights_key;
+            gpu->has_lights = true;
+        }
         GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->accum_fbo[gpu->accum_cur]));
         GL(glClearColor(0, 0, 0, 0));
         GL(glClear(GL_COLOR_BUFFER_BIT));
@@ -542,6 +911,10 @@ void pathtracer_gpu_iter(pathtracer_t *pt)
         pt->force_restart = false;
         if (pt->status == PT_FINISHED) pt->status = PT_RUNNING;
     }
+
+    // The number of samples can be increased after the rendering finished.
+    if (pt->status == PT_FINISHED && gpu->samples < pt->num_samples)
+        pt->status = PT_RUNNING;
 
     if (gpu->samples < pt->num_samples) {
         // Adapt the number of samples per frame to keep the UI responsive.
@@ -573,10 +946,18 @@ void pathtracer_gpu_release(pathtracer_t *pt)
     GL(glDeleteTextures(1, &gpu->table_tex));
     GL(glDeleteTextures(1, &gpu->atlas_tex));
     GL(glDeleteTextures(1, &gpu->materials_tex));
+    GL(glDeleteTextures(1, &gpu->lights_pos_tex));
+    GL(glDeleteTextures(1, &gpu->lights_emit_tex));
+    GL(glDeleteTextures(1, &gpu->env_tex));
+    GL(glDeleteTextures(1, &gpu->env_cond_tex));
+    GL(glDeleteTextures(1, &gpu->env_marg_tex));
     GL(glDeleteTextures(2, gpu->accum_tex));
     GL(glDeleteFramebuffers(2, gpu->accum_fbo));
+    GL(glDeleteTextures(BLOOM_LEVELS * 2, (GLuint*)gpu->bloom_tex));
+    GL(glDeleteFramebuffers(BLOOM_LEVELS * 2, (GLuint*)gpu->bloom_fbo));
     GL(glDeleteFramebuffers(1, &gpu->display_fbo));
     GL(glDeleteBuffers(1, &gpu->quad_buffer));
+    free(gpu->lights);
     free(gpu);
     pt->gpu = NULL;
 }
