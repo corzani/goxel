@@ -294,6 +294,9 @@ uniform float u_sun_cos;      // Cosine of the sun angular radius.
 uniform int   u_world_type;
 uniform vec3  u_world_color;  // Multiplied by the world energy.
 uniform float u_world_energy;
+uniform vec3  u_ambient;      // Uniform light added on top of the world.
+uniform vec3  u_bg_color;     // Background color seen by the camera.
+uniform int   u_use_bg;       // Set to show u_bg_color as background.
 uniform vec3  u_sky_zenith;   // Procedural sky colors.
 uniform vec3  u_sky_horizon;
 uniform vec3  u_sky_ground;
@@ -561,19 +564,26 @@ vec3 get_sky(vec3 d)
 {
     float theta, phi;
 
-    if (u_world_type == 0) return vec3(0.0); // None.
-    if (u_world_type == 1) return u_world_color; // Uniform.
-    if (u_world_type == 3) { // Image.
+    vec3 c;
+
+    if (u_world_type == 0) {        // None.
+        c = vec3(0.0);
+    } else if (u_world_type == 1) { // Uniform.
+        c = u_world_color;
+    } else if (u_world_type == 3) { // Image.
         theta = acos(clamp(d.z, -1.0, 1.0));
         phi = atan(d.y, d.x);
-        return texture(u_env, vec2(phi / (2.0 * PI) + 0.5, theta / PI)).rgb *
-               u_world_energy;
+        c = texture(u_env, vec2(phi / (2.0 * PI) + 0.5, theta / PI)).rgb *
+            u_world_energy;
+    } else {
+        // Procedural sky: gradient from the ground to the horizon and the
+        // zenith.
+        c = (d.z >= 0.0) ?
+            mix(u_sky_horizon, u_sky_zenith, sqrt(d.z)) * u_world_energy :
+            mix(u_sky_horizon, u_sky_ground, smoothstep(0.0, 0.4, -d.z)) *
+            u_world_energy;
     }
-    // Procedural sky: gradient from the ground to the horizon and the zenith.
-    if (d.z >= 0.0)
-        return mix(u_sky_horizon, u_sky_zenith, sqrt(d.z)) * u_world_energy;
-    return mix(u_sky_horizon, u_sky_ground, smoothstep(0.0, 0.4, -d.z)) *
-           u_world_energy;
+    return c + u_ambient;
 }
 
 // Clamp the indirect light contributions, to limit the fireflies.
@@ -852,7 +862,9 @@ bool sample_env(out vec3 wi, out vec3 le, out float pdf)
     theta = (float(y) + rand()) / float(u_env_size.y) * PI;
     phi = ((float(x) + rand()) / float(u_env_size.x) - 0.5) * 2.0 * PI;
     wi = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
-    le = c * u_world_energy;
+    // Same value as get_sky, so that both estimators of the same integral
+    // agree and the MIS weights do not lose the ambient light.
+    le = c * u_world_energy + u_ambient;
     pdf = lum * float(u_env_size.x) * float(u_env_size.y) /
           (u_env_integral * 2.0 * PI * PI);
     return pdf > 0.0;
@@ -943,11 +955,17 @@ void main()
 
     for (i = 0; i < u_bounces + 16 && bounce <= u_bounces; i++) {
         if (!trace(ro, rd, medium, hit)) {
-            if (i == 0 && u_world_type == 0) alpha = 0.0;
+            if (i == 0 && u_world_type == 0 && u_use_bg == 0) alpha = 0.0;
             if (medium == -1) {
-                q = (bounce == 0) ? 1.0 : mis(last_pdf, env_pdf(rd));
-                radiance += clamp_indirect(throughput * get_sky(rd) * q,
-                                           bounce);
+                if (i == 0 && u_use_bg != 0) {
+                    // The camera sees the background color, while the world
+                    // keeps lighting the scene.
+                    radiance += throughput * u_bg_color;
+                } else {
+                    q = (bounce == 0) ? 1.0 : mis(last_pdf, env_pdf(rd));
+                    radiance += clamp_indirect(throughput * get_sky(rd) * q,
+                                               bounce);
+                }
             }
             break;
         }

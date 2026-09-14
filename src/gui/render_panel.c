@@ -138,6 +138,10 @@ void gui_render_panel(void)
             if (pt->world.type == PT_WORLD_UNIFORM)
                 gui_color_small(_("Color"), pt->world.color);
         }
+        gui_input_float(_("Ambient"), &pt->world.ambient, 0.05, 0, 5, "%.2f");
+        gui_checkbox(_("Background"), &pt->world.use_background, NULL);
+        if (pt->world.use_background)
+            gui_color_small(_("Background color"), pt->world.background);
     } gui_section_end();
 
     if (gui_section_begin(_("Floor"), GUI_SECTION_COLLAPSABLE_CLOSED)) {

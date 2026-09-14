@@ -76,6 +76,13 @@ typedef struct {
         float energy;
         uint8_t color[4];
         char image[1024]; // Environment image, for PT_WORLD_IMAGE.
+        // Uniform light added on top of the world, so that an image or a
+        // sky can be combined with a soft fill light, like MagicaVoxel.
+        float ambient;
+        // Color seen by the camera in place of the world, so that the
+        // background can stay dark while the world still lights the scene.
+        uint8_t background[4];
+        bool use_background;
     } world;
     struct {
         int type;

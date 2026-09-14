@@ -463,6 +463,12 @@ void save_to_file(const image_t *img, const char *path)
                            sizeof(pt->world.energy));
     chunk_write_dict_value(&c, out, "world_color", pt->world.color,
                            sizeof(pt->world.color));
+    chunk_write_dict_value(&c, out, "world_ambient", &pt->world.ambient,
+                           sizeof(pt->world.ambient));
+    chunk_write_dict_value(&c, out, "world_background", pt->world.background,
+                           sizeof(pt->world.background));
+    chunk_write_dict_value(&c, out, "world_use_bg", &pt->world.use_background,
+                           sizeof(pt->world.use_background));
     chunk_write_dict_value(&c, out, "world_image", pt->world.image,
                            strlen(pt->world.image));
     chunk_write_dict_value(&c, out, "floor_type", &pt->floor.type,
@@ -731,6 +737,9 @@ int load_from_file(const char *path, bool replace)
                 DICT_CPY("world_sky", pt->world.sky);
                 DICT_CPY("world_energy", pt->world.energy);
                 DICT_CPY("world_color", pt->world.color);
+                DICT_CPY("world_ambient", pt->world.ambient);
+                DICT_CPY("world_background", pt->world.background);
+                DICT_CPY("world_use_bg", pt->world.use_background);
                 if (strcmp(dict_key, "world_image") == 0)
                     copy_string(pt->world.image, dict_value);
                 DICT_CPY("floor_type", pt->floor.type);

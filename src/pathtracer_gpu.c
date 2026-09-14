@@ -702,6 +702,7 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
     const image_t *image = goxel.image;
     gl_shader_t *shader;
     float light_dir[3], world_color[3], floor_rect[4], center[3] = {};
+    float ambient[3], bg_color[3];
     float sky_zenith[3], sky_horizon[3], sky_ground[3];
     float floor_z = 0;
     int i;
@@ -762,6 +763,14 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
     gl_update_uniform(shader, "u_world_type", pt->world.type);
     gl_update_uniform(shader, "u_world_energy", pt->world.energy);
     gl_update_uniform(shader, "u_world_color", world_color);
+
+    for (i = 0; i < 3; i++) {
+        ambient[i] = pt->world.ambient;
+        bg_color[i] = pt->world.background[i] / 255.f;
+    }
+    gl_update_uniform(shader, "u_ambient", ambient);
+    gl_update_uniform(shader, "u_bg_color", bg_color);
+    gl_update_uniform(shader, "u_use_bg", pt->world.use_background ? 1 : 0);
 
     pathtracer_sky_colors(pt->world.sky, sky_zenith, sky_horizon, sky_ground);
     gl_update_uniform(shader, "u_sky_zenith", sky_zenith);

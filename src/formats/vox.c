@@ -793,8 +793,25 @@ static void import_render_settings(image_t *image, const node_t *tree,
             snprintf(pt->world.image, sizeof(pt->world.image), "%s",
                      env_path);
             LOG_I("Using environment image %s", env_path);
+            // MagicaVoxel adds the uniform light on top of the image, while
+            // we would otherwise replace the world with it and lose the
+            // fill light that keeps the dark surfaces readable.
+            pt->world.ambient = dict_get_float(get_robj(tree, "_uni"),
+                                               "_i", 0);
         } else {
             LOG_I("Environment image %s not found next to the model", name);
+        }
+    }
+
+    // Background color, shown in place of the world, that keeps lighting.
+    if ((robj = get_robj(tree, "_bg"))) {
+        v = dict_get(robj, "_color");
+        if (v && sscanf(v, "%d %d %d",
+                        &color[0], &color[1], &color[2]) == 3) {
+            for (i = 0; i < 3; i++)
+                pt->world.background[i] = clamp(color[i], 0, 255);
+            pt->world.background[3] = 255;
+            pt->world.use_background = true;
         }
     }
 
