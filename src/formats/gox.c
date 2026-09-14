@@ -451,6 +451,8 @@ void save_to_file(const image_t *img, const char *path)
     chunk_write_dict_value(&c, out, "exposure", &pt->exposure,
                            sizeof(pt->exposure));
     chunk_write_dict_value(&c, out, "bloom", &pt->bloom, sizeof(pt->bloom));
+    chunk_write_dict_value(&c, out, "denoise", &pt->denoise,
+                           sizeof(pt->denoise));
     chunk_write_dict_value(&c, out, "sun_angle", &pt->sun_angle,
                            sizeof(pt->sun_angle));
     chunk_write_dict_value(&c, out, "world_type", &pt->world.type,
@@ -723,6 +725,7 @@ int load_from_file(const char *path, bool replace)
                 DICT_CPY("bounces", pt->bounces);
                 DICT_CPY("exposure", pt->exposure);
                 DICT_CPY("bloom", pt->bloom);
+                DICT_CPY("denoise", pt->denoise);
                 DICT_CPY("sun_angle", pt->sun_angle);
                 DICT_CPY("world_type", pt->world.type);
                 DICT_CPY("world_sky", pt->world.sky);

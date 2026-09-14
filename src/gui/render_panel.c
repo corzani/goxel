@@ -69,6 +69,7 @@ void gui_render_panel(void)
             pt->bounces = clamp(pt->bounces, 0, 16);
         gui_input_float(_("Exposure"), &pt->exposure, 0.1, 0, 10, "%.1f");
         gui_input_float(_("Bloom"), &pt->bloom, 0.05, 0, 2, "%.2f");
+        gui_checkbox(_("Denoise"), &pt->denoise, NULL);
         gui_input_float(_("Aperture"), &goxel.image->active_camera->aperture,
                         0.5, 0, 100, "%.1f");
         gui_input_float(_("Focus"), &goxel.image->active_camera->focus,

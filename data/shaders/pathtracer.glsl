@@ -62,6 +62,9 @@ uniform float     u_samples;
 uniform float     u_exposure;
 uniform sampler2D u_bloom;
 uniform float     u_bloom_intensity;
+uniform sampler2D u_denoised;   // Filtered color, without the base color.
+uniform sampler2D u_albedo;     // Accumulated base color.
+uniform float     u_denoise;    // Set to use the filtered color.
 
 // ACES filmic tone mapping curve (fit by Krzysztof Narkowicz).
 vec3 aces(vec3 x)
@@ -81,14 +84,22 @@ void main()
     ivec2 size = textureSize(u_accum, 0);
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec4 v;
+    vec3 albedo;
 
     // Flip the image, so that the first row is the top of the image.
     p.y = size.y - 1 - p.y;
-    v = texelFetch(u_accum, p, 0) / max(u_samples, 1.0);
+    if (u_denoise > 0.5) {
+        // The filtered color doesn't have the base color of the surfaces.
+        v = texelFetch(u_denoised, p, 0);
+        albedo = texelFetch(u_albedo, p, 0).rgb / max(u_samples, 1.0);
+        v.rgb *= max(albedo, vec3(0.01));
+    } else {
+        v = texelFetch(u_accum, p, 0) / max(u_samples, 1.0);
+        // The accumulated colors are premultiplied by the alpha.
+        if (v.a > 0.0) v.rgb /= v.a;
+    }
     v.rgb += texture(u_bloom, (vec2(p) + 0.5) / vec2(size)).rgb *
              u_bloom_intensity;
-    // The accumulated colors are premultiplied by the alpha.
-    if (v.a > 0.0) v.rgb /= v.a;
     out_color = vec4(linear_to_srgb(aces(v.rgb * u_exposure)), v.a);
 }
 
@@ -151,9 +162,116 @@ void main()
 
 #endif // BLOOM_UP
 
+#ifdef DENOISE
+
+/*
+ * Edge avoiding à-trous filter (Dammertz et al. 2010), used to remove the
+ * noise of the renderings with few samples.
+ *
+ * The filter runs several times with taps further and further apart.  The
+ * weight of a tap depends on how much its color, normal and distance differ
+ * from the center, so that the edges are kept.  The color tolerance shrinks
+ * when the samples accumulate, so that the filter fades away as the image
+ * converges.
+ */
+
+uniform sampler2D u_color;   // Accumulated color, or previous iteration.
+uniform sampler2D u_albedo;  // Accumulated base color.
+uniform sampler2D u_normal;  // Accumulated normal (xyz) and distance (w).
+uniform float     u_samples;
+uniform int       u_step;    // Distance between the taps.
+uniform int       u_first;   // Set for the first iteration.
+
+float luminance(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Color of a pixel, divided by the base color for the first iteration.
+vec4 get_color(ivec2 p)
+{
+    vec4 c = texelFetch(u_color, p, 0);
+    vec3 albedo;
+
+    if (u_first == 0) return c;
+    c /= max(u_samples, 1.0);
+    if (c.a > 0.0) c.rgb /= c.a;
+    albedo = texelFetch(u_albedo, p, 0).rgb / max(u_samples, 1.0);
+    return vec4(c.rgb / max(albedo, vec3(0.01)), c.a);
+}
+
+/*
+ * A pixel that received a single very bright sample keeps its value: the
+ * color weight rejects all of its neighbours, so the filter has nothing to
+ * mix it with.  Before the first iteration we pull such pixels down to the
+ * luminance of the ones around them.
+ */
+vec3 clamp_firefly(ivec2 p, vec3 c)
+{
+    ivec2 size = textureSize(u_color, 0), q;
+    float mean = 0.0, max_lum, lum;
+    int x, y;
+
+    for (y = -1; y <= 1; y++)
+    for (x = -1; x <= 1; x++) {
+        if (x == 0 && y == 0) continue;
+        q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+        mean += luminance(get_color(q).rgb);
+    }
+    mean /= 8.0;
+    max_lum = 4.0 * mean + 0.1;
+    lum = luminance(c);
+    return (lum > max_lum) ? c * max_lum / lum : c;
+}
+
+void main()
+{
+    const float KERNEL[3] = float[3](0.375, 0.25, 0.0625);
+    ivec2 size = textureSize(u_color, 0);
+    ivec2 p = ivec2(gl_FragCoord.xy), q;
+    vec4 c = get_color(p), o;
+    vec4 n = texelFetch(u_normal, p, 0) / max(u_samples, 1.0), nq;
+    vec3 sum = c.rgb, nn, nnq;
+    float sum_w = 1.0, w, lc = luminance(c.rgb), sigma;
+    int x, y;
+
+    if (u_first != 0) c.rgb = clamp_firefly(p, c.rgb);
+    lc = luminance(c.rgb);
+
+    // Tolerance on the color differences, tighter as the image converges.
+    sigma = 0.02 + 0.8 / sqrt(max(u_samples, 1.0));
+    nn = (length(n.xyz) > 0.0) ? normalize(n.xyz) : vec3(0.0);
+
+    for (y = -2; y <= 2; y++)
+    for (x = -2; x <= 2; x++) {
+        if (x == 0 && y == 0) continue;
+        q = clamp(p + ivec2(x, y) * u_step, ivec2(0), size - 1);
+        o = get_color(q);
+        nq = texelFetch(u_normal, q, 0) / max(u_samples, 1.0);
+        nnq = (length(nq.xyz) > 0.0) ? normalize(nq.xyz) : vec3(0.0);
+
+        w = KERNEL[abs(x)] * KERNEL[abs(y)];
+        w *= exp(-abs(lc - luminance(o.rgb)) / sigma);
+        if (length(n.xyz) > 0.0 && length(nq.xyz) > 0.0)
+            w *= pow(max(dot(nn, nnq), 0.0), 32.0);
+        w *= exp(-abs(n.w - nq.w) / (0.5 * float(u_step) + 0.001));
+
+        sum += o.rgb * w;
+        sum_w += w;
+    }
+    out_color = vec4(sum / sum_w, c.a);
+}
+
+#endif // DENOISE
+
 #ifdef ACCUMULATE
 
+layout(location = 1) out vec4 out_albedo;
+layout(location = 2) out vec4 out_normal;
+
 uniform sampler2D  u_prev;
+uniform sampler2D  u_prev_albedo;
+uniform sampler2D  u_prev_normal;
 uniform usampler3D u_table;
 uniform sampler3D  u_atlas;
 uniform sampler2D  u_materials;
@@ -789,6 +907,10 @@ void main()
     material_t m;
     int i, bounce = 0, medium = -1;
     bool specular;
+    // Guides for the denoiser: base color, normal and distance of the first
+    // surface seen by the ray.
+    vec3 first_albedo = vec3(1.0), first_normal = vec3(0.0);
+    float first_dist = 0.0;
 
     g_rng_state = (uint(px.x) * 73856093u) ^ (uint(px.y) * 19349663u) ^
                   (uint(u_seed) * 83492791u);
@@ -828,6 +950,13 @@ void main()
                                            bounce);
             }
             break;
+        }
+
+        if (i == 0) {
+            first_normal = hit.normal;
+            first_dist = hit.t;
+            if (hit.material >= 0)
+                first_albedo = get_material(hit.material, hit.color).albedo;
         }
 
         // Refractive materials interfaces.
@@ -927,6 +1056,9 @@ void main()
     if (q > 32.0) radiance *= 32.0 / q;
 
     out_color = texelFetch(u_prev, px, 0) + vec4(radiance, alpha);
+    out_albedo = texelFetch(u_prev_albedo, px, 0) + vec4(first_albedo, 1.0);
+    out_normal = texelFetch(u_prev_normal, px, 0) +
+                 vec4(first_normal, first_dist);
 }
 
 #endif // ACCUMULATE

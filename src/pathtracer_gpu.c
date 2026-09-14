@@ -125,10 +125,13 @@ struct pathtracer_gpu {
     GLuint      bloom_fbo[2][BLOOM_LEVELS];
     int         bloom_size[BLOOM_LEVELS][2];
 
-    // Accumulation buffers.
+    // Accumulation buffers: color, base color and normal with distance.
+    // The two last ones are the guides of the denoiser.
     int         w, h;
-    GLuint      accum_tex[2];
+    GLuint      accum_tex[2][3];
     GLuint      accum_fbo[2];
+    GLuint      denoise_tex[2];     // Ping pong of the filter iterations.
+    GLuint      denoise_fbo[2];
     int         accum_cur;  // Index of the buffer with the current samples.
     int         samples;
     int         samples_per_frame;
@@ -616,7 +619,7 @@ static void update_buffers(pathtracer_gpu_t *gpu, int w, int h)
 {
     int i, j;
 
-    if (gpu->accum_tex[0] && gpu->w == w && gpu->h == h) return;
+    if (gpu->accum_tex[0][0] && gpu->w == w && gpu->h == h) return;
 
     for (i = 0; i < BLOOM_LEVELS; i++) {
         gpu->bloom_size[i][0] = max(1, (w / 2) >> i);
@@ -639,15 +642,37 @@ static void update_buffers(pathtracer_gpu_t *gpu, int w, int h)
         }
     }
 
+    const GLenum BUFFERS[3] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+                               GL_COLOR_ATTACHMENT2};
     for (i = 0; i < 2; i++) {
-        if (!gpu->accum_tex[i])
-            gpu->accum_tex[i] = create_texture(GL_TEXTURE_2D, GL_LINEAR);
-        GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[i]));
-        GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0,
-                        GL_RGBA, GL_FLOAT, NULL));
         GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->accum_fbo[i]));
+        for (j = 0; j < 3; j++) {
+            if (!gpu->accum_tex[i][j])
+                gpu->accum_tex[i][j] = create_texture(GL_TEXTURE_2D,
+                                                      GL_LINEAR);
+            GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[i][j]));
+            GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0,
+                            GL_RGBA, GL_FLOAT, NULL));
+            GL(glFramebufferTexture2D(GL_FRAMEBUFFER, BUFFERS[j],
+                                      GL_TEXTURE_2D,
+                                      gpu->accum_tex[i][j], 0));
+        }
+        GL(glDrawBuffers(3, BUFFERS));
+        assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+               GL_FRAMEBUFFER_COMPLETE);
+    }
+
+    for (i = 0; i < 2; i++) {
+        if (!gpu->denoise_tex[i]) {
+            gpu->denoise_tex[i] = create_texture(GL_TEXTURE_2D, GL_LINEAR);
+            GL(glGenFramebuffers(1, &gpu->denoise_fbo[i]));
+        }
+        GL(glBindTexture(GL_TEXTURE_2D, gpu->denoise_tex[i]));
+        GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0,
+                        GL_RGBA, GL_FLOAT, NULL));
+        GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->denoise_fbo[i]));
         GL(glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                  GL_TEXTURE_2D, gpu->accum_tex[i], 0));
+                                  GL_TEXTURE_2D, gpu->denoise_tex[i], 0));
         assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
                GL_FRAMEBUFFER_COMPLETE);
     }
@@ -761,7 +786,13 @@ static void accumulate(pathtracer_gpu_t *gpu, const pathtracer_t *pt, int n)
         GL(glBindFramebuffer(GL_FRAMEBUFFER,
                              gpu->accum_fbo[1 - gpu->accum_cur]));
         GL(glActiveTexture(GL_TEXTURE0));
-        GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur]));
+        GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur][0]));
+        GL(glActiveTexture(GL_TEXTURE9));
+        GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur][1]));
+        GL(glActiveTexture(GL_TEXTURE10));
+        GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur][2]));
+        gl_update_uniform(shader, "u_prev_albedo", 9);
+        gl_update_uniform(shader, "u_prev_normal", 10);
         gl_update_uniform(shader, "u_seed", gpu->seed++);
         draw_quad(gpu);
         gpu->accum_cur = 1 - gpu->accum_cur;
@@ -791,7 +822,7 @@ static GLuint render_bloom(pathtracer_gpu_t *gpu)
         GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->bloom_fbo[0][i]));
         GL(glViewport(0, 0, size[0], size[1]));
         GL(glBindTexture(GL_TEXTURE_2D, (i == 0) ?
-                         gpu->accum_tex[gpu->accum_cur] :
+                         gpu->accum_tex[gpu->accum_cur][0] :
                          gpu->bloom_tex[0][i - 1]));
         gl_update_uniform(shader, "u_dst_size", size);
         gl_update_uniform(shader, "u_scale",
@@ -821,6 +852,44 @@ static GLuint render_bloom(pathtracer_gpu_t *gpu)
     return gpu->bloom_tex[1][0];
 }
 
+/*
+ * Run the denoising filter on the accumulated samples, with a few
+ * iterations of an edge avoiding filter.  Return the filtered texture,
+ * that doesn't include the base color of the surfaces.
+ */
+static GLuint render_denoise(pathtracer_gpu_t *gpu)
+{
+    const shader_define_t defines[] = {{"DENOISE", true}, {}};
+    const int NB_ITERATIONS = 4;
+    gl_shader_t *shader;
+    int i, cur = 0;
+
+    shader = shader_get("pathtracer", defines, ATTR_NAMES, NULL);
+    GL(glUseProgram(shader->prog));
+    GL(glViewport(0, 0, gpu->w, gpu->h));
+    GL(glActiveTexture(GL_TEXTURE1));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur][1]));
+    GL(glActiveTexture(GL_TEXTURE2));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur][2]));
+    gl_update_uniform(shader, "u_color", 0);
+    gl_update_uniform(shader, "u_albedo", 1);
+    gl_update_uniform(shader, "u_normal", 2);
+    gl_update_uniform(shader, "u_samples", (float)gpu->samples);
+
+    for (i = 0; i < NB_ITERATIONS; i++) {
+        GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->denoise_fbo[cur]));
+        GL(glActiveTexture(GL_TEXTURE0));
+        GL(glBindTexture(GL_TEXTURE_2D, (i == 0) ?
+                         gpu->accum_tex[gpu->accum_cur][0] :
+                         gpu->denoise_tex[1 - cur]));
+        gl_update_uniform(shader, "u_first", (i == 0) ? 1 : 0);
+        gl_update_uniform(shader, "u_step", 1 << i);
+        draw_quad(gpu);
+        cur = 1 - cur;
+    }
+    return gpu->denoise_tex[1 - cur];
+}
+
 // Tone map the accumulated samples into the pathtracer texture.
 static void display(pathtracer_gpu_t *gpu, pathtracer_t *pt)
 {
@@ -828,8 +897,10 @@ static void display(pathtracer_gpu_t *gpu, pathtracer_t *pt)
     gl_shader_t *shader;
     uint32_t key;
     GLuint bloom_tex = gpu->bloom_tex[1][0];
+    GLuint denoised_tex = gpu->denoise_tex[0];
 
     if (pt->bloom > 0) bloom_tex = render_bloom(gpu);
+    if (pt->denoise) denoised_tex = render_denoise(gpu);
 
     shader = shader_get("pathtracer", defines, ATTR_NAMES, NULL);
     GL(glBindFramebuffer(GL_FRAMEBUFFER, gpu->display_fbo));
@@ -841,14 +912,21 @@ static void display(pathtracer_gpu_t *gpu, pathtracer_t *pt)
     GL(glViewport(0, 0, gpu->w, gpu->h));
     GL(glUseProgram(shader->prog));
     GL(glActiveTexture(GL_TEXTURE0));
-    GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur]));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur][0]));
     GL(glActiveTexture(GL_TEXTURE1));
     GL(glBindTexture(GL_TEXTURE_2D, bloom_tex));
+    GL(glActiveTexture(GL_TEXTURE2));
+    GL(glBindTexture(GL_TEXTURE_2D, denoised_tex));
+    GL(glActiveTexture(GL_TEXTURE3));
+    GL(glBindTexture(GL_TEXTURE_2D, gpu->accum_tex[gpu->accum_cur][1]));
     gl_update_uniform(shader, "u_accum", 0);
     gl_update_uniform(shader, "u_samples", (float)gpu->samples);
     gl_update_uniform(shader, "u_exposure", pt->exposure);
     gl_update_uniform(shader, "u_bloom", 1);
     gl_update_uniform(shader, "u_bloom_intensity", max(pt->bloom, 0));
+    gl_update_uniform(shader, "u_denoised", 2);
+    gl_update_uniform(shader, "u_albedo", 3);
+    gl_update_uniform(shader, "u_denoise", pt->denoise ? 1.0 : 0.0);
     draw_quad(gpu);
 
     // Copy the final image into the buffer, so that it can be saved.
@@ -856,6 +934,7 @@ static void display(pathtracer_gpu_t *gpu, pathtracer_t *pt)
     key = XXH32(&gpu->scene_key, sizeof(gpu->scene_key), 0);
     key = XXH32(&pt->exposure, sizeof(pt->exposure), key);
     key = XXH32(&pt->bloom, sizeof(pt->bloom), key);
+    key = XXH32(&pt->denoise, sizeof(pt->denoise), key);
     key = XXH32(&gpu->samples, sizeof(gpu->samples), key);
     if (key == gpu->display_key) return;
     gpu->display_key = key;
@@ -951,8 +1030,10 @@ void pathtracer_gpu_release(pathtracer_t *pt)
     GL(glDeleteTextures(1, &gpu->env_tex));
     GL(glDeleteTextures(1, &gpu->env_cond_tex));
     GL(glDeleteTextures(1, &gpu->env_marg_tex));
-    GL(glDeleteTextures(2, gpu->accum_tex));
+    GL(glDeleteTextures(6, (GLuint*)gpu->accum_tex));
     GL(glDeleteFramebuffers(2, gpu->accum_fbo));
+    GL(glDeleteTextures(2, gpu->denoise_tex));
+    GL(glDeleteFramebuffers(2, gpu->denoise_fbo));
     GL(glDeleteTextures(BLOOM_LEVELS * 2, (GLuint*)gpu->bloom_tex));
     GL(glDeleteFramebuffers(BLOOM_LEVELS * 2, (GLuint*)gpu->bloom_fbo));
     GL(glDeleteFramebuffers(1, &gpu->display_fbo));

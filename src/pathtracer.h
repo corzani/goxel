@@ -68,6 +68,7 @@ typedef struct {
     int bounces;        // GPU engine only.
     float exposure;     // GPU engine only.
     float bloom;        // Bloom intensity, GPU engine only.
+    bool denoise;       // Filter the noise, GPU engine only.
     float sun_angle;    // Sun angular diameter (degree), GPU engine only.
     struct {
         int type;
