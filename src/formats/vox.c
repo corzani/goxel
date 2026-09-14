@@ -290,6 +290,8 @@ static void on_matl_dict(void *user, const char *key, int size,
     if (strcmp(key, "_trans") == 0) node->matl.trans = atof(value);
     if (strcmp(key, "_d") == 0) node->matl.density = atof(value);
     if (strcmp(key, "_ri") == 0) node->matl.ri = atof(value);
+    // Newer files use '_ior', that stores the index of refraction minus one.
+    if (strcmp(key, "_ior") == 0) node->matl.ri = 1 + atof(value);
 }
 
 static void on_store_dict(void *user, const char *key, int size,
@@ -524,9 +526,11 @@ static bool matl_to_material(const node_t *matl, const uint8_t color[4],
     case VOX_MATL_EMIT:
         // _emit is the amount (0 to 1) and _flux the power (0 to 4, shown
         // as 1 to 5 in MagicaVoxel).  Goxel emission is an absolute color.
-        // The scale was tuned by comparing with MagicaVoxel renders.
+        // The power saturates above flux 2: a single emitter set to the
+        // highest values would otherwise be bright enough to wash out the
+        // whole scene.
         srgb8_to_rgb(color, rgb);
-        vec3_mul(rgb, 4 * matl->matl.emit * pow(10, matl->matl.flux),
+        vec3_mul(rgb, 4 * matl->matl.emit * pow(4, fmin(matl->matl.flux, 2)),
                  mat->emission);
         mat->metallic = 0;
         mat->roughness = matl->matl.rough;
@@ -913,6 +917,26 @@ static int vox_import(const file_format_t *format, image_t *image,
             volume_delete(groups[i].volumes[j]);
         }
     }
+    /*
+     * The diffuse materials are not metallic, and have their own roughness.
+     * Without an explicit material the layers would use the goxel default
+     * one, that is slightly metallic, and would show specular reflections
+     * that are not in the original scene.
+     */
+    for (c = 1; c < 256; c++) {
+        if (matls[c] && matls[c]->matl.type == VOX_MATL_DIFFUSE) break;
+    }
+    if (c < 256) {
+        material = MATERIAL_DEFAULT;
+        material.metallic = 0;
+        material.roughness = matls[c]->matl.rough;
+        snprintf(material.name, sizeof(material.name), "Diffuse");
+        mat = image_add_material(image, material_copy(&material));
+        DL_FOREACH(image->layers, layer) {
+            if (!layer->material) layer->material = mat;
+        }
+    }
+
     image->active_material = active_material;
     free(groups);
 
